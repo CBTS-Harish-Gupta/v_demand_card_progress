@@ -1,0 +1,194 @@
+--=====================================================================================
+--Author:  Harish Kumar Gupta
+--Create Date: 04/15/2024
+--Description: provides deail juourny of each card and show the time spent and elapased over each lane.
+--======================================================================================
+
+CREATE OR REPLACE VIEW "v_demand_Card_Progress" AS 
+WITH
+dim_date_table AS (
+   select
+    id
+,   dim_date
+,   sprint_start_date_range
+,   (date_trunc('day',sprint_start_date_range)+INTERVAL '11' day) as sprint_end_date_range
+,   (case when(date_trunc('week',current_date)=sprint_start_date_range and lag(date_trunc('day',sprint_start_date_range)-interval '1' day) OVER(order by dim_date) is null) then sprint_start_date_range
+    when((date_trunc('week',current_date)-interval '7' day) = sprint_start_date_range and lag(date_trunc('day',sprint_start_date_range)-interval '1' day) OVER(order by dim_date) is null) then sprint_start_date_range end) as current_sprint_start_date
+,   is_holiday_ai
+,   holiday_name_ai
+   from default.v_dim_date_ai
+)
+,
+sort_table as (
+select 
+*
+,   max(current_sprint_start_date) over() as s_current_sprint_date
+from dim_date_table
+)
+,
+creater_detail as (
+SELECT
+source_id
+,full_name
+from trello_gold_prod.members
+)
+, Card_Data_snap AS (
+   SELECT
+     labels
+    , name as Card_name
+    , board_id
+    , board_name
+    , list
+    , source_record_id
+    , members
+    , total_points
+    , pos
+    , closed closed_status
+    , request_type
+    , ticket_number
+    , description
+    , priority
+    , business_unit
+    , done
+    , CAST(date_last_activity AS timestamp) date_last_activity
+    , CAST(created_date AS timestamp) created_date
+    , CAST(done_date AS timestamp) done_date
+    , CAST(ts AS timestamp) ts_date
+    , CAST(processed_at AS timestamp) processed_date
+    , CAST(report_date AS date) report_date
+    , year(report_date) report_year
+   FROM
+     demand_gold_prod.cards_enriched_snap
+     --where card_id = '626bea82258c318c9d361d94'
+)
+,card_Action_snap AS (
+SELECT
+id as action_id
+, id_member_creator as Creater_Id
+, type as action_description
+, date as action_date
+, data_card_id as card_id
+, data_custom_field_id as field_id
+, data_custom_field_name as field_name
+, data_custom_field_item_id_value as item_id_value
+, data_custom_field_item_value_text as value_text
+, data_custom_field_item_value_checked as value_checked
+, data_custom_field_item_value_number as value_number
+, data_card_pos as card_pos
+, data_old_pos as old_pos
+, data_card_id_list as card_id_list
+, data_old_id_list as old_id_list
+, data_card_desc as card_description
+, data_old_desc as old_description
+, data_card_closed as card_closed
+, data_old_closed as old_closed
+, data_card_name as d_card_name
+, data_list_name as list_name
+, data_old_name as old_name
+, data_card_due as card_due
+, data_old_due as old_due
+, data_card_due_complete as card_due_complete
+, data_old_due_complete as old_due_complete
+, data_id_member_added as id_member_added
+, data_card_id_labels as card_labels
+, data_old_id_labels as old_id_labels
+, CAST(ts AS timestamp) card_ts_date
+, id_organization as id_organization
+, id_board as id_board
+FROM
+  trello_gold_prod.actions at
+ WHERE (id_board_partition = '626bea82258c318c9d361d57')
+)
+,
+Final_Table_sub AS(
+SELECT * from Card_Data_snap
+ left join card_Action_snap on (Card_Data_snap.source_record_id=card_Action_snap.card_id)
+)
+,Final_Table As (
+SELECT
+*
+,concat(card_name,card_id, cast(action_date as varchar),  action_description) as key
+from Final_Table_sub
+)
+,FF_Table AS (
+SELECT 
+*
+,cast(created_date as date) as created_date_snap
+,row_number() over(partition by key) as RW_Number
+from Final_Table left join creater_detail on (Final_Table.creater_id = creater_detail.source_id)
+)
+,Table_with_Sprint AS (
+SELECT *
+,concat(list_name,cast(cast(action_date as timestamp) as varchar)) as list_key
+from FF_Table left join dim_date_table on (FF_Table.created_date_snap  = dim_date_table.dim_date) where list_name is not null
+), table_with_lane as (
+SELECT
+board_name
+,labels
+,members
+,total_points
+,card_id
+,card_name
+,Creater_Id
+,full_name
+,ticket_number
+,cast(action_date as timestamp) as action_date
+,action_description
+,list_name
+,list_key
+,if(list_name is not null,row_number() over (partition by card_name order by action_date),null) as list_rank
+,min(action_date) over (partition by card_name,list_key order by action_date) as lane_start
+--,max(action_date) over (partition by list_name,card_id) as lane_end
+,cast(date_diff('hour',"created_date","action_date") as decimal(10,2))+cast(cast(date_diff('minute',"created_date","action_date")%60 as decimal(10,2))/60 as decimal(10,2) ) as elapsed_time_hour
+,(cast(date_diff('hour',"created_date","action_date") as decimal(10,2))+cast(cast(date_diff('minute',"created_date","action_date")%60 as decimal(10,2))/60 as decimal(10,2) ))*60 as elapsed_time_minute
+,cast(created_date as timestamp) as created_date
+,sprint_start_date_range as sprint_start_date
+,sprint_end_date_range as sprint_end_date
+from Table_with_Sprint where RW_Number = 1
+order by members,card_name,list_rank
+)
+,lane_start_time_tbl as (
+select *
+,LEAD(lane_start) OVER (partition by card_name order by lane_start asc) AS next_lane_start_time
+from table_with_lane
+)
+,lane_end_time_tble as (
+select *
+,max(next_lane_start_time) over (partition by list_key order by lane_start) as lane_end
+from lane_start_time_tbl
+),
+table_with_Slane_time as (
+select
+*
+,cast(date_diff('hour',"lane_start","lane_end") as decimal(10,3))+cast(cast(date_diff('minute',"lane_start","lane_end")%60 as decimal(10,3))/60 as decimal(10,3) ) as lane_time_hour
+,(cast(date_diff('hour',"lane_start","lane_end") as decimal(10,3))*60+cast(cast(date_diff('minute',"lane_start","lane_end")%60 as decimal(10,3))/60 as decimal(10,3) )*60) as lane_time_minute
+,next_lane_start_time
+from lane_end_time_tble
+order by members,card_id,action_date asc
+)
+select
+board_name
+,labels
+,members
+,total_points
+,card_id
+,card_name
+,Creater_Id
+,full_name
+,ticket_number
+,action_date
+,action_description
+,list_name
+,list_rank
+,created_date
+,lane_start as lane_start_time
+,lane_end as lane_end_time
+,elapsed_time_hour
+,elapsed_time_minute
+,lane_time_hour
+,lane_time_minute
+,sum(lane_time_hour) over(partition by card_name,list_name) as total_lane_time_hour
+,sum(lane_time_minute) over(partition by card_name,list_name) as total_lane_time_minute
+,sprint_start_date
+,sprint_end_date
+from table_with_Slane_time order by members,card_name,list_rank
